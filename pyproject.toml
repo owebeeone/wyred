@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wyred"
+version = "0.1.0"
+description = "wyred — the declarative electronics engine (authoring surface + elaborator + data-path emitters). Port of elecscad ga019 modeller/."
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["src"]
