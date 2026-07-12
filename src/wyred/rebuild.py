@@ -17,7 +17,18 @@
                               document (``wyred.paths.json_str``, the one
                               canonical byte form) against the on-disk
                               <name>.bom.json / <name>.pinmap.json /
-                              <name>.records.json.
+                              <name>.records.json. A set that emitted a
+                              <name>.placement.json (only-when-declared) also
+                              re-derives it via ``wyred.paths.build_placement``
+                              from the on-disk <name>.l1.json ALONE — placement
+                              has no L2 lowering, so the layer-1 document is its
+                              only primary. A set that emitted a
+                              <name>.testplan.json (only-when-declared) has its
+                              ``checks`` block re-derived via
+                              ``wyred.paths.build_testplan`` from its OWN on-disk
+                              ``declarations`` block plus the rebuilt records +
+                              pin-map — the declarations (authored, never in
+                              l1) are the primary, the checks the secondary.
 ``... --dir <artifact-dir> --all``
                               every artifact set (*.l1.json) in the dir.
                               A set without a netlist fails at layer 1 by
@@ -63,18 +74,47 @@ def check_artifact(out_dir: Path, name: str):
     g_d = _read_json(out_dir, name, "l2")
     a_d = _read_json(out_dir, name, "alloc")
     l_d = _read_json(out_dir, name, "l1")
+    records_doc = datapaths.build_records(name, l_d, a_d)
+    pinmap_doc = datapaths.build_pinmap(name, g_d, a_d)
     rebuilt = {
         "bom": datapaths.json_str(datapaths.build_bom(name, g_d, a_d)),
-        "pinmap": datapaths.json_str(
-            datapaths.build_pinmap(name, g_d, a_d)),
-        "records": datapaths.json_str(
-            datapaths.build_records(name, l_d, a_d)),
+        "pinmap": datapaths.json_str(pinmap_doc),
+        "records": datapaths.json_str(records_doc),
     }
+    # .placement.json is a secondary re-derivable from the on-disk L1 ALONE
+    # (no netlist/allocation input): rebuild it to the same standard, but only
+    # for artifact sets that actually emitted one (placement is
+    # only-when-declared, so most sets carry none).
+    if (out_dir / ("%s.placement.json" % name)).exists():
+        rebuilt["placement"] = datapaths.json_str(
+            datapaths.build_placement(name, l_d))
+    # .testplan.json re-derives its CHECKS block from its OWN on-disk
+    # declarations block (the primary — authored, never carried in l1) plus the
+    # rebuilt records + pin-map. Only-when-declared, so most sets carry none.
+    if (out_dir / ("%s.testplan.json" % name)).exists():
+        tp_disk = _read_json(out_dir, name, "testplan")
+        rebuilt["testplan"] = datapaths.json_str(
+            datapaths.build_testplan(name, tp_disk.get("declarations", []),
+                                     records_doc, pinmap_doc))
     mismatched = []
     for path_name, want in rebuilt.items():
         got = (out_dir / ("%s.%s.json" % (name, path_name))).read_text()
         if want != got:
             mismatched.append(path_name)
+    # .cir + its .cir.json sidecar re-derive from (l2, alloc) ALONE — the spice
+    # models ride the L2 at resolve (§7), so the deck is a pure function of the
+    # primaries like bom/pinmap. Only-when-emitted: the on-disk deck's EXISTENCE
+    # is the frozen gating decision (§0/§6), so a set without a .cir has none to
+    # rebuild. These two artifacts do not follow the ``.<path>.json`` naming
+    # (the deck is raw text, the sidecar is ``<name>.cir.json``), so they are
+    # byte-compared directly rather than through the generic map above.
+    if (out_dir / ("%s.cir" % name)).exists():
+        deck, sidecar = datapaths.build_cir(name, g_d, a_d)
+        if deck != (out_dir / ("%s.cir" % name)).read_text():
+            mismatched.append("cir")
+        if (datapaths.json_str(sidecar)
+                != (out_dir / ("%s.cir.json" % name)).read_text()):
+            mismatched.append("cir.json")
     return mismatched
 
 

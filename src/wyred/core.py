@@ -60,6 +60,18 @@ _PIN_NAME_VOCAB = frozenset({
     "VCC", "VDD", "AVDD", "DVDD", "VDDA", "VDDIO", "VSS", "VEE", "GND",
 })
 
+# The closed side vocabulary for edge() (WyredPlacementSemantics section 3):
+# KiCad's y axis grows downward, so the checker maps north=min-y, south=max-y,
+# west=min-x, east=max-x. A side outside this set — including one resolved
+# from a late() reference — is a compose-time load error (mirrors the
+# unknown-lock-decision-class rejection).
+PLACEMENT_SIDES = frozenset({"north", "south", "east", "west"})
+
+# The single declared placement vocabulary default (semantics section 4):
+# edge()'s courtyard-to-outline tolerance. A default VALUE, recorded in the
+# artifact verbatim — never a silent one.
+EDGE_TOL_MM_DEFAULT = 1.0
+
 
 class ModellerError(Exception):
     """A STRUCTURED authoring/elaboration error — the load-error channel
@@ -287,6 +299,219 @@ def mutual_exclusion(subjects: Tuple[str, str],
     return MutexDecl(subjects, inputs, **attrs)
 
 
+# ---------------------------------------------------------------------------
+# Placement constraints (WyredPlacementSemantics.md): positive assertions over
+# role ids / net-class names. Each is minted once per DECLARING instance, its
+# subjects namespaced by instance path — the mutual_exclusion precedent
+# (declare ``near("pmu", "mcu")`` once inside a composite, get one constraint
+# per instantiation). No primitive has an implicit default PRESENCE (a module
+# declaring none contributes no placement section); the one declared value
+# default is ``edge.tol_mm``. All measurement is checker-side (Phase 2) — the
+# engine only elaborates and emits the asserted intent.
+# ---------------------------------------------------------------------------
+
+class NearDecl(Decl):
+    def __init__(self, a: str, b: str, max_mm: Any):
+        super().__init__()
+        self.subjects = (a, b)
+        self.max_mm = max_mm
+
+
+def near(a: str, b: str, *, max_mm: float) -> NearDecl:
+    """Declare that two roles sit within ``max_mm`` of each other —
+    courtyard-to-courtyard nearest-edge distance (semantics section 3; the
+    fallback when a footprint has no courtyard is its pad bounding box,
+    flagged by the checker, never silent). ``a`` / ``b`` are module-relative
+    role ids, namespaced by instance path at elaboration; ``max_mm`` may be a
+    ``late(...)`` reference into the declaring module's params."""
+    return NearDecl(a, b, max_mm)
+
+
+class KeepoutDecl(Decl):
+    def __init__(self, zone: Any, roles: Tuple[str, ...]):
+        super().__init__()
+        self.zone = zone
+        self.roles = tuple(roles)
+
+
+def keepout(zone: str, roles: Any) -> KeepoutDecl:
+    """Declare that the listed roles' courtyards stay OUTSIDE the named
+    keepout/rule area on the realized board. ``zone`` is a symbolic name
+    matched exactly against the board (a board with no rule area of that name
+    fails closed — an unnamed keepout is an unverifiable keepout, semantics
+    section 3); ``roles`` is a role id or an iterable of them, namespaced per
+    instance."""
+    if isinstance(roles, str):
+        roles = (roles,)
+    return KeepoutDecl(zone, tuple(roles))
+
+
+class EdgeDecl(Decl):
+    def __init__(self, connector: str, side: Any,
+                 tol_mm: Any = EDGE_TOL_MM_DEFAULT):
+        super().__init__()
+        self.connector = connector
+        self.side = side
+        self.tol_mm = tol_mm
+
+
+def edge(connector: str, side: str,
+         tol_mm: float = EDGE_TOL_MM_DEFAULT) -> EdgeDecl:
+    """Declare that ``connector`` sits at a named board edge. ``side`` is the
+    closed vocabulary {north, south, east, west} in the board-outline
+    bounding-box frame (KiCad y grows downward: north=min-y, south=max-y,
+    west=min-x, east=max-x — semantics section 3); an unknown side is a
+    compose-time load error. ``tol_mm`` is the courtyard-to-outline tolerance
+    (declared default 1.0 mm, recorded verbatim). ``connector`` is a role id
+    namespaced per instance."""
+    return EdgeDecl(connector, side, tol_mm)
+
+
+class ThermalDecl(Decl):
+    def __init__(self, role: str, copper_mm2: Any):
+        super().__init__()
+        self.role = role
+        self.copper_mm2 = copper_mm2
+
+
+def thermal(role: str, *, copper_mm2: float) -> ThermalDecl:
+    """Declare that ``role`` has at least ``copper_mm2`` of connected copper
+    for heat spreading — v0 measures filled-zone area on the net of the role's
+    power pads, on those pads' layers only (semantics section 3; a role with
+    no power-role pads fails closed). ``role`` is a role id namespaced per
+    instance; ``copper_mm2`` may be a ``late(...)`` reference."""
+    return ThermalDecl(role, copper_mm2)
+
+
+class SeparationDecl(Decl):
+    def __init__(self, class_a: Any, class_b: Any, min_mm: Any):
+        super().__init__()
+        self.class_a = class_a
+        self.class_b = class_b
+        self.min_mm = min_mm
+
+
+def separation(class_a: str, class_b: str, *, min_mm: float) -> SeparationDecl:
+    """Declare a minimum clearance ``min_mm`` between two net classes.
+    ``class_a`` / ``class_b`` are DECLARED rail or ground names (validated
+    against the L1 vocabulary — a name matching no declared rail/ground is a
+    compose-time load error; they are design vocabulary, NOT namespaced role
+    ids). v0 metric is clearance over pads+zones (semantics section 3);
+    surface-path creepage is deferred. The Tinkerforge EVSE mains/SELV split
+    is the motivating exercise: separation("VAC_L", "GND", min_mm=6.0)."""
+    return SeparationDecl(class_a, class_b, min_mm)
+
+
+# ---------------------------------------------------------------------------
+# Test declarations (WyredPlanTestplan / ProposalTestplanContract): the four
+# ``expect_*`` markers that declare acceptance ranges over the design's L1
+# vocabulary. They mirror the ParamDecl/DemandDecl harvest pattern (creation-
+# order harvested, MRO-merged, zero-arg safe) and — unlike placement — are
+# NEVER emitted into the layer-1 document (proposal section 3: l1.json stays
+# byte-identical and the harness schema_l1 is untouched). The engine elaborates
+# them into a self-contained DECLARATION RECORD carried on the EmitResult; the
+# testplan emitter (paths.build_testplan) derives the CHECKS block from
+# (declarations, records, pin-map). References are L1 vocabulary only (rail /
+# bus names — design vocabulary; demand ids — minted instance paths); never a
+# refdes (law 8). ``late(...)`` is legal in every argument (resolve_value
+# recurses). These markers introduce the FIRST deliberate acceptance ranges
+# (the ratified crack in the rigid ±0.05 V scalar model); the design-time
+# VTOL/_VTOL float-noise absorbers are untouched (RATIFY-3).
+# ---------------------------------------------------------------------------
+
+class ExpectRailDecl(Decl):
+    def __init__(self, tp: str, volts: Any, tol: Any, tol_pct: Any):
+        super().__init__()
+        self.tp = tp
+        self.volts = volts
+        self.tol = tol
+        self.tol_pct = tol_pct
+
+
+def expect_rail(tp: str, volts: Any = None, tol: Any = None,
+                tol_pct: Any = None) -> "ExpectRailDecl":
+    """Declare an acceptance interval on a rail's measured voltage.
+    ``tp`` names a DECLARED rail (design vocabulary — validated against the L1
+    rail set; an unknown name is ``TEST_UNKNOWN_RAIL``). Tolerance is REQUIRED
+    (RATIFY-1): exactly one of ``tol`` (absolute volts) or ``tol_pct`` (percent
+    of nominal) — omitting both, or giving both, is ``TEST_BAD_TOLERANCE``; the
+    band NEVER silently inherits the 0.05 V float-noise absorber. ``volts``
+    (the nominal) may be omitted, in which case it derives one-way from the L1
+    rail declaration's voltage (RATIFY-2, say-only-the-non-default). The closed
+    interval is ``[nominal - t, nominal + t]`` (RATIFY-7, boundary-inclusive),
+    computed by the emitter."""
+    return ExpectRailDecl(tp, volts, tol, tol_pct)
+
+
+class ExpectI2cScanDecl(Decl):
+    def __init__(self, bus: str, addrs: Any):
+        super().__init__()
+        self.bus = bus
+        self.addrs = addrs
+
+
+def expect_i2c_scan(bus: str, addrs: Any = None) -> "ExpectI2cScanDecl":
+    """Declare that an I2C bus scan finds EXACTLY a set of addresses
+    (RATIFY-6, exact-set: a missing address fails, an unexpected extra address
+    also fails — a rogue device is a disagreement, not a freebie). ``bus``
+    names a DECLARED bus (validated against the L1 bus set; unknown is
+    ``TEST_UNKNOWN_BUS``). ``addrs`` defaults to the addresses DERIVED from the
+    bus's L1 demand attachments (the ``i2c_addr`` of every demand on this bus,
+    say-only-the-non-default); an explicit ``addrs=`` overrides. Addresses are
+    integers (7-bit)."""
+    return ExpectI2cScanDecl(bus, addrs)
+
+
+class ExpectCurrentDecl(Decl):
+    def __init__(self, rail: str, max_ma: Any, state: Any):
+        super().__init__()
+        self.rail = rail
+        self.max_ma = max_ma
+        self.state = state
+
+
+def expect_current(rail: str, max_ma: Any, state: str) -> "ExpectCurrentDecl":
+    """Declare a ONE-SIDED upper bound on a rail's current draw in a named
+    operating state (RATIFY-4). ``rail`` names a DECLARED rail (validated;
+    unknown is ``TEST_UNKNOWN_RAIL``). ``max_ma`` is the inequality bound
+    (measured <= max_ma; no lower bound in v0) and must be a positive number
+    (else ``TEST_BAD_TOLERANCE``). ``state`` is a FREE STRING operating state
+    ("sleep", "active", ...) matched exactly against the measurement record
+    (a dimension with no L1 counterpart); it must be non-empty. No testpoint
+    is required — the probe method (shunt / supply readout) is a bench-card
+    matter, so a current check is never ``TESTPLAN_UNPROBEABLE``."""
+    return ExpectCurrentDecl(rail, max_ma, state)
+
+
+class ExpectSignalDecl(Decl):
+    def __init__(self, tp: str, freq: Any, freq_tol_ppm: Any,
+                 freq_tol_pct: Any, duty: Any, duty_tol_pts: Any):
+        super().__init__()
+        self.tp = tp
+        self.freq = freq
+        self.freq_tol_ppm = freq_tol_ppm
+        self.freq_tol_pct = freq_tol_pct
+        self.duty = duty
+        self.duty_tol_pts = duty_tol_pts
+
+
+def expect_signal(tp: str, freq: Any = None, freq_tol_ppm: Any = None,
+                  freq_tol_pct: Any = None, duty: Any = None,
+                  duty_tol_pts: Any = None) -> "ExpectSignalDecl":
+    """Declare per-quantity acceptance ranges on a probed signal (RATIFY-5,
+    typed tolerances — no cross-quantity defaults). ``tp`` names a DECLARED
+    demand id (a minted instance path such as ``debug.prog``; validated against
+    the L1 demand set — unknown is ``TEST_UNKNOWN_DEMAND``); the emitter binds
+    it to the ``test_point`` components realized on that demand's nets. At least
+    one of ``freq`` / ``duty`` must be given (else ``TEST_BAD_TOLERANCE`` — a
+    signal check that measures nothing). When ``freq`` is given, exactly one of
+    ``freq_tol_ppm`` (crystals) or ``freq_tol_pct`` (RC-class) is REQUIRED; when
+    ``duty`` is given, ``duty_tol_pts`` (absolute percentage points) is
+    REQUIRED."""
+    return ExpectSignalDecl(tp, freq, freq_tol_ppm, freq_tol_pct, duty,
+                            duty_tol_pts)
+
+
 class LockDecl(Decl):
     def __init__(self, name: str, covers: Tuple[str, ...], owner: str = "",
                  sync_point: str = ""):
@@ -350,6 +575,14 @@ class Module:
     series: str = "A"                # document series (intent roots only)
     expected_l1: Tuple[str, ...] = ()   # self-check: expected oracle codes
     expect_escalation: bool = False     # self-check: rung-4 escalation due
+    emit_spice: bool = False            # SPICE emission request (WyredSpice
+                                        # Contract §6): a fully-modelled intent
+                                        # emits a .cir unconditionally; set this
+                                        # True to also emit (with a confessed
+                                        # not_simulated list) a PARTIALLY
+                                        # modelled one — corpus data, never a
+                                        # CLI flag, so artifacts stay a pure
+                                        # function of the declared corpus.
 
     _decls: List[Tuple[str, Decl]] = []
     _intent_name: Optional[str] = None
@@ -514,9 +747,15 @@ __all__ = [
     "Module", "ModellerError", "Refinement",
     "param", "demand", "provide", "rail", "ground", "bond", "bus", "pool",
     "mutual_exclusion", "lock_group", "use", "late", "pin", "bind",
+    "near", "keepout", "edge", "thermal", "separation",
+    "expect_rail", "expect_i2c_scan", "expect_current", "expect_signal",
     "MODULES", "INTENTS", "REFINEMENTS", "DECISION_CLASSES",
+    "PLACEMENT_SIDES", "EDGE_TOL_MM_DEFAULT",
     "resolve_value", "validate_rail_name",
     "ParamDecl", "DemandDecl", "ProvideDecl", "RailDecl", "GroundDecl",
     "BondDecl", "BusDecl", "PoolDecl", "MutexDecl", "LockDecl", "ChildDecl",
+    "NearDecl", "KeepoutDecl", "EdgeDecl", "ThermalDecl", "SeparationDecl",
+    "ExpectRailDecl", "ExpectI2cScanDecl", "ExpectCurrentDecl",
+    "ExpectSignalDecl",
     "PinOp", "BindOp", "Late", "Decl",
 ]

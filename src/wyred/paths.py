@@ -28,7 +28,10 @@ byte-identical artifacts on every path.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
+
+from .core import ModellerError
 
 
 def json_str(obj: Dict[str, Any]) -> str:
@@ -187,6 +190,728 @@ def build_records(name: str, l1: Dict[str, Any],
     if l1.get("forked_from") is not None:
         out["forked_from"] = dict(l1["forked_from"])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Placement (WyredPlacementSemantics section 5): the declared-intent artifact
+# ---------------------------------------------------------------------------
+
+def build_placement(name: str, l1: Dict[str, Any]) -> Dict[str, Any]:
+    """The ``.placement.json`` artifact: the L1 ``placement`` section, stamped
+    like the pin-map and with its constraint rows sorted by minted id
+    (semantics section 5). A PURE function of the on-disk layer-1 document
+    alone — no netlist, no allocation artifact — so it rebuilds
+    byte-identically from primaries like bom/records (there is no L2 lowering
+    of placement in v0: every measurement is checker-side).
+
+    The stamp derives from the L1 document itself: ``series`` and the
+    lock-group versions the document carries (placement joins no lock class in
+    v0, semantics section 7, so for today's placement corpus this is
+    ``{}``). Rows pass through verbatim (id, kind, declared_by, subjects,
+    resolved params) — all numbers are authored/late-resolved, deterministic
+    from source, so there is nothing to re-round here."""
+    lock_groups = l1.get("allocation", {}).get("lock_groups", []) or []
+    stamp = {"series": l1.get("series", ""),
+             "locks": {g["name"]: int(g.get("version", 0))
+                       for g in lock_groups}}
+    constraints = sorted((dict(r) for r in l1.get("placement", []) or []),
+                         key=lambda r: r["id"])
+    return {
+        "artifact": name,
+        "path": "placement",
+        "stamp": stamp,
+        "constraints": constraints,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Testplan (WyredPlanTestplan step 1.3 / ProposalTestplanContract): the
+# derived, self-contained acceptance artifact
+# ---------------------------------------------------------------------------
+
+def _round6(x: Any) -> float:
+    """RATIFY-7 canonicalization for DERIVED numbers (computed bounds, derived
+    nominals): a plain ``round(x, 6)`` JSON number. Authored numbers pass
+    through verbatim (they never reach this)."""
+    return round(float(x), 6)
+
+
+def _test_points(pinmap: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every ``test_point`` component's terminals as flat probe candidates
+    (proposal section 2: testpoint-ness is INFERRED from realized
+    ``kind == "test_point"`` — L1 stays untouched). Each carries the pinmap
+    facts a probe point needs: ``{refdes, pad, net, role, function}``."""
+    out: List[Dict[str, Any]] = []
+    for c in pinmap.get("components", []):
+        if c.get("kind") != "test_point":
+            continue
+        for t in c.get("terminals", []):
+            out.append({"refdes": c["refdes"], "pad": t.get("name", ""),
+                        "net": t.get("net"), "role": t.get("role", ""),
+                        "function": t.get("function", "")})
+    return out
+
+
+def _probe(tp: Dict[str, Any]) -> Dict[str, Any]:
+    return {"refdes": tp["refdes"], "pad": tp["pad"], "net": tp["net"]}
+
+
+def _sorted_probes(tps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [_probe(t) for t in
+            sorted(tps, key=lambda t: (t["refdes"], t["pad"]))]
+
+
+def _unprobeable(rid: str, kind: str, subject: str, why: str) -> ModellerError:
+    return ModellerError(
+        "TESTPLAN_UNPROBEABLE",
+        "%s check %r (subject %r) %s — no probeable test_point (proposal "
+        "section 2: a check with no probe point is a structured emit failure, "
+        "never a silently thinner testplan)" % (kind, rid, subject, why))
+
+
+def _check_for(decl: Dict[str, Any],
+               tps: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Derive ONE check from its declaration + the pin-map's test points
+    (bounds, probe binding, provenance). The declaration is self-contained
+    (nominal / addresses already resolved at elaboration), so this needs no
+    L1 document — proposal section 3."""
+    rid, kind, subject = decl["id"], decl["kind"], decl["subject"]
+    declared_by = decl["declared_by"]
+    prov: Dict[str, Any] = {"declaration": rid, "subject": subject}
+    check: Dict[str, Any] = {"id": rid, "kind": kind,
+                             "declared_by": declared_by, "subject": subject}
+
+    if kind == "rail":
+        nominal = decl["nominal"]
+        if "tol" in decl:
+            t = float(decl["tol"])
+            prov["tolerance"] = {"tol": decl["tol"]}
+        else:
+            t = float(nominal) * float(decl["tol_pct"]) / 100.0
+            prov["tolerance"] = {"tol_pct": decl["tol_pct"]}
+        check["expect"] = {"nominal": nominal,
+                           "low": _round6(nominal - t),
+                           "high": _round6(nominal + t)}
+        taps = [tp for tp in tps if tp["net"] == subject]
+        grounds = [tp for tp in tps if tp["role"] == "ground"]
+        if not taps:
+            raise _unprobeable(rid, kind, subject,
+                               "no test_point on the rail's net")
+        if not grounds:
+            raise _unprobeable(rid, kind, subject,
+                               "no ground-reference test_point (a rail check "
+                               "requires both the rail tap AND a GND tap)")
+        gref = _sorted_probes(grounds)[0]
+        check["probe"] = {"points": _sorted_probes(taps), "ground_ref": gref}
+        prov["nominal_source"] = decl["nominal_source"]
+
+    elif kind == "i2c_scan":
+        check["expect"] = {"addrs": list(decl["addrs"])}
+        points = [tp for tp in tps
+                  if tp["net"] and tp["net"].startswith(subject + "_")]
+        if not points:
+            raise _unprobeable(rid, kind, subject,
+                               "no test_point on the bus's %s_* nets" % subject)
+        check["probe"] = {"points": _sorted_probes(points),
+                          "ground_ref": None}
+        prov["addrs_source"] = decl["addrs_source"]
+
+    elif kind == "current":
+        # RATIFY-4 / section 2: current needs no test_point (probe method is a
+        # bench-card matter) — never TESTPLAN_UNPROBEABLE.
+        check["expect"] = {"max_ma": decl["max_ma"], "state": decl["state"]}
+        check["probe"] = {"points": [], "ground_ref": None}
+
+    elif kind == "signal":
+        expect: Dict[str, Any] = {}
+        if "freq" in decl:
+            freq = float(decl["freq"])
+            if "freq_tol_ppm" in decl:
+                ft = freq * float(decl["freq_tol_ppm"]) / 1_000_000.0
+                prov["freq_tolerance"] = {"freq_tol_ppm": decl["freq_tol_ppm"]}
+            else:
+                ft = freq * float(decl["freq_tol_pct"]) / 100.0
+                prov["freq_tolerance"] = {"freq_tol_pct": decl["freq_tol_pct"]}
+            expect["freq"] = decl["freq"]
+            expect["freq_low"] = _round6(freq - ft)
+            expect["freq_high"] = _round6(freq + ft)
+        if "duty" in decl:
+            duty = float(decl["duty"])
+            dp = float(decl["duty_tol_pts"])
+            prov["duty_tolerance"] = {"duty_tol_pts": decl["duty_tol_pts"]}
+            expect["duty"] = decl["duty"]
+            expect["duty_low"] = _round6(duty - dp)
+            expect["duty_high"] = _round6(duty + dp)
+        check["expect"] = expect
+        points = [tp for tp in tps if tp["net"]
+                  and (tp["net"] == subject
+                       or tp["net"].startswith(subject + "."))]
+        if not points:
+            raise _unprobeable(rid, kind, subject,
+                               "no test_point on the demand's realized nets")
+        check["probe"] = {"points": _sorted_probes(points),
+                          "ground_ref": None}
+    else:                                       # pragma: no cover - defensive
+        raise ModellerError("TESTPLAN_UNKNOWN_KIND",
+                            "test declaration %r has unknown kind %r"
+                            % (rid, kind))
+
+    check["provenance"] = prov
+    return check
+
+
+def build_testplan(name: str, decls: List[Dict[str, Any]],
+                   records: Dict[str, Any],
+                   pinmap: Dict[str, Any]) -> Dict[str, Any]:
+    """The ``.testplan.json`` artifact (proposal section 5): the elaborated
+    ``declarations`` block (authored intent, pass-through) plus a derived
+    ``checks`` block — bounds from tolerances (RATIFY-1/5/7), probe points
+    inferred from the pin-map's ``test_point`` components (section 2),
+    provenance per check. A PURE function of ``(declarations, records,
+    pin-map)`` — no L1 document — so it rebuilds byte-identically from those
+    primaries (the checks re-derive from the on-disk testplan's own
+    declarations + records + pin-map). Stamped like every artifact and tied to
+    the specific frozen pin-map the measurement runs against (section 1.1
+    point 5): the stamp is the pin-map's, and ``records`` (the other stamped
+    secondary of this emit) must agree, else ``TESTPLAN_STAMP_MISMATCH`` — a
+    testplan is never derived across an inconsistent record/pin-map pair.
+
+    ``decls``  the elaborated ``expect_*`` records (``EmitResult
+               .test_declarations`` at emit; the on-disk testplan's own
+               ``declarations`` block at rebuild — the same bytes either way).
+    Checks are sorted by minted id (section 5)."""
+    rec_stamp = records.get("stamp")
+    pm_stamp = pinmap.get("stamp")
+    if rec_stamp != pm_stamp:
+        raise ModellerError(
+            "TESTPLAN_STAMP_MISMATCH",
+            "records stamp %r != pin-map stamp %r for %r — the testplan cannot "
+            "be attributed to a single frozen pin-map"
+            % (rec_stamp, pm_stamp, name))
+    declarations = sorted((dict(d) for d in decls), key=lambda d: d["id"])
+    tps = _test_points(pinmap)
+    checks = sorted((_check_for(d, tps) for d in declarations),
+                    key=lambda c: c["id"])
+    return {
+        "artifact": name,
+        "path": "testplan",
+        "stamp": dict(pm_stamp or {}),
+        "declarations": declarations,
+        "checks": checks,
+    }
+
+
+# ---------------------------------------------------------------------------
+# SPICE .cir data path (WyredPlanSpice step 1.2 / WyredSpiceContract §1-§7):
+# the THIRD denotation. ``build_cir`` consumes the SAME emitted documents (the
+# layer-2 graph + the stamped alloc), classifies every component against the
+# ratified model semantics, and produces a deterministic ngspice-dialect deck
+# plus its machine-readable confession sidecar. Ported conventions from ga005's
+# emit_spice.py (kind->element-letter table, ground->0, per-component element
+# cards) but with the §3 name-preserving nodes instead of ga005's integers.
+#
+# GATING is the emit loop's call, never build_cir's: build_cir is a PURE
+# function of (graph, alloc) that always renders the modelled subset + confesses
+# the rest, so (a) rebuild re-derives it from primaries and (b) the on-disk
+# deck's EXISTENCE is the recorded gating decision (fully-modelled -> always;
+# partially-modelled -> only when the intent requested emit_spice, §6). The
+# emit_spice request never needs to ride the artifacts: at rebuild time the
+# decision is already frozen in the file's presence.
+# ---------------------------------------------------------------------------
+
+# The deck-format revision recorded in every deck header (§9). Distinct from
+# the engine's solver_version (read from the alloc primary) and the contract
+# rev; bumping it is a deliberate golden-affecting event.
+SPICE_DECK_VERSION = "0"
+
+# §2 passives auto-map: a CLOSED kind -> element-letter table. Value is taken
+# verbatim from the L2 component and canonicalized (§2a); nothing here invents
+# a value, and everything NOT tabled needs an explicit spice_model or lands in
+# the confession.
+_SPICE_AUTOMAP: Dict[str, str] = {
+    "resistor": "R", "capacitor": "C", "inductor": "L", "diode": "D"}
+
+# §2a value canonicalization: SPICE magnitude prefixes (case-insensitive in,
+# canonical case out; mega only ever via "meg"/"MEG" per §2a, so a bare "m"/"M"
+# stays milli — SPICE's own reading) and the unit letters stripped (F/H/Ω/R).
+_SPICE_PREFIX = {"f": "f", "p": "p", "n": "n", "u": "u", "µ": "u",
+                 "m": "m", "k": "k", "meg": "MEG", "g": "g", "t": "t"}
+_SPICE_VALUE_RE = re.compile(
+    r"\s*([+-]?(?:\d+\.?\d*|\.\d+))\s*"          # magnitude
+    r"(MEG|meg|[fpnuµmkgtFPNUMKGT])?\s*"    # optional SI prefix
+    r"(?:[FfHh]|[Rr]|Ω|[Oo]hms?)?\s*")      # optional unit, stripped
+
+
+def _canon_spice_value(raw: Any) -> Optional[str]:
+    """An L2 value string -> a SPICE-legal magnitude token, or None when it
+    does not parse (§2a: a value that does not parse is never a guessed number
+    — the part joins the confession)."""
+    if raw is None:
+        return None
+    m = _SPICE_VALUE_RE.fullmatch(str(raw))
+    if m is None:
+        return None
+    num, prefix = m.group(1), m.group(2)
+    if prefix:
+        return num + _SPICE_PREFIX[prefix.lower()]
+    return num
+
+
+def _sanitize_node(name: str) -> str:
+    """§3 name-preserving node token: ``+`` -> ``P``, ``-`` -> ``M``, any other
+    non-word char -> ``_``, digit-leading names prefixed ``N`` (``+3V3`` ->
+    ``P3V3``, ``3V3`` -> ``N3V3``). Ground handling (kind ``ground`` -> ``0``)
+    is the caller's, upstream of this."""
+    out: List[str] = []
+    for ch in name:
+        if ch == "+":
+            out.append("P")
+        elif ch == "-":
+            out.append("M")
+        elif ch.isalnum() or ch == "_":
+            out.append(ch)
+        else:
+            out.append("_")
+    s = "".join(out)
+    if s and s[0].isdigit():
+        s = "N" + s
+    return s
+
+
+def _spice_node_map(graph: Dict[str, Any]) -> Dict[str, str]:
+    """net name -> deck node token (§3): every ground-kind net -> ``0``
+    unconditionally (the intended many-to-one), every other net -> its
+    sanitized name. Two distinct non-ground nets sanitizing to one token is a
+    HARD emit error — the map is bijective-or-refused, never suffixed, so the
+    partition differential (1.3) stays cheap."""
+    node_of: Dict[str, str] = {}
+    owner: Dict[str, str] = {}
+    for net in graph.get("nets", []):
+        name = net["name"]
+        if net.get("kind") == "ground":
+            node_of[name] = "0"
+            continue
+        tok = _sanitize_node(name)
+        prev = owner.get(tok)
+        if prev is not None and prev != name:
+            raise ModellerError(
+                "SPICE_NODE_COLLISION",
+                "nets %r and %r both sanitize to deck node %r — the net->node "
+                "map must stay bijective (§3: refused, never suffixed)"
+                % (prev, name, tok))
+        owner[tok] = name
+        node_of[name] = tok
+    return node_of
+
+
+def _spice_model_of(comp: Dict[str, Any]
+                    ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """How to render one component in the deck, or why it cannot be. Returns
+    ``(render, None)`` for a modelled component (``render`` a primitive or
+    subckt descriptor) or ``(None, reason)`` for an unmodelled one
+    (``"no_model"`` | ``"value_unparseable"``). An explicit ``spice_model``
+    attr (§1) wins over the §2 auto-map; a malformed model type is a structured
+    error, never a silent confession."""
+    attrs = comp.get("attrs") or {}
+    sm = attrs.get("spice_model")
+    if isinstance(sm, dict):
+        model = sm.get("model")
+        if model == "primitive":
+            return {"kind": "primitive", "letter": sm.get("letter", ""),
+                    "value": str(sm.get("value", "")),
+                    "params": dict(sm.get("params") or {})}, None
+        if model == "subckt":
+            return {"kind": "subckt", "name": sm.get("name", ""),
+                    "text": sm.get("text", "")}, None
+        raise ModellerError(
+            "SPICE_BAD_MODEL",
+            "component %r carries a spice_model with unknown model type %r "
+            "(expected 'primitive' or 'subckt', §1)"
+            % (comp.get("refdes"), model))
+    kind = comp.get("kind", "")
+    if kind in _SPICE_AUTOMAP:
+        val = _canon_spice_value(comp.get("value"))
+        if val is None:
+            return None, "value_unparseable"
+        return {"kind": "primitive", "letter": _SPICE_AUTOMAP[kind],
+                "value": val, "params": {}}, None
+    return None, "no_model"
+
+
+def build_cir(name: str, graph: Dict[str, Any],
+              alloc: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """The ngspice-dialect ``.cir`` deck + its ``.cir.json`` confession sidecar
+    for one emitted netlist — a PURE, deterministic function of the on-disk
+    primaries (l2 graph + alloc), so two resolves are byte-identical and the
+    rebuild CLI re-derives it exactly.
+
+    Every component is classified (§1/§2): modelled ones render as element cards
+    (``<letter><refdes> <node...> <value>`` for primitives — the letter+refdes
+    element name keeps the refdes recoverable by stripping one char, which the
+    1.3 reader relies on; ``X<refdes> <node...> <subckt>`` for subckt refs, with
+    the inline model text deduplicated by name, §4). Nodes are the §3
+    name-preserving tokens (ground -> ``0``). The rest are confessed in
+    ``not_simulated`` (§5), naming EVERY unmodelled refdes with its kind and
+    reason — never a silently thinner deck. Element cards are sorted by refdes
+    and subckt blocks by name, so the bytes are canonical.
+
+    Returns ``(deck_text, sidecar_dict)`` unconditionally; whether either is
+    WRITTEN is the emit loop's gating call (see ``spice_should_emit``)."""
+    node_of = _spice_node_map(graph)
+    term_net: Dict[Tuple[str, str], str] = {}
+    for net in graph.get("nets", []):
+        for ref, pin in net.get("nodes", []):
+            term_net[(ref, pin)] = net["name"]
+
+    def node_for(ref: str, pin: str) -> str:
+        net = term_net.get((ref, pin))
+        if net is not None:
+            return node_of[net]
+        # An unconnected terminal of a MODELLED component gets its own
+        # deterministic floating node (ga005's convention) — distinct from the
+        # net token namespace, so it never silently merges with a real net.
+        return "%s_%s" % (_sanitize_node(ref), _sanitize_node(pin))
+
+    modelled: Dict[str, str] = {}
+    not_simulated: List[Dict[str, str]] = []
+    cards: List[Tuple[str, str]] = []
+    subckts: Dict[str, str] = {}
+    for comp in graph.get("components", []):
+        ref = comp["refdes"]
+        render, reason = _spice_model_of(comp)
+        if render is None:
+            not_simulated.append({"refdes": ref, "kind": comp.get("kind", ""),
+                                  "reason": reason})
+            continue
+        nodes = [node_for(ref, t["name"]) for t in comp.get("terminals", [])]
+        if render["kind"] == "primitive":
+            letter = render["letter"]
+            modelled[ref] = letter
+            tail = render["value"]
+            for k in sorted(render["params"]):
+                tail += " %s=%s" % (k, render["params"][k])
+            cards.append((ref, "%s%s %s %s"
+                          % (letter, ref, " ".join(nodes), tail)))
+        else:
+            sname = render["name"]
+            modelled[ref] = "subckt:%s" % sname
+            text = render["text"]
+            if sname in subckts and subckts[sname] != text:
+                raise ModellerError(
+                    "SPICE_SUBCKT_CONFLICT",
+                    "two subckt models named %r carry different inline text — "
+                    "inline models must be name-unique (§4)" % sname)
+            subckts[sname] = text
+            cards.append((ref, "X%s %s %s" % (ref, " ".join(nodes), sname)))
+
+    stamp = _stamp(alloc)
+    header = [
+        "* wyred spice deck: %s" % name,
+        "* engine=%s deck_format=%s"
+        % (alloc.get("solver_version", ""), SPICE_DECK_VERSION),
+        "* stamp=%s" % json.dumps(stamp, sort_keys=True),
+        "* not_simulated: %d (see %s.cir.json)" % (len(not_simulated), name),
+    ]
+    nonident = sorted((net, tok) for net, tok in node_of.items()
+                      if tok != net)
+    if nonident:
+        header.append("* nodes:")
+        for net, tok in nonident:
+            header.append("*   %s -> %s" % (net, tok))
+    subckt_lines = [subckts[s].rstrip("\n") for s in sorted(subckts)]
+    body = [txt for _ref, txt in sorted(cards, key=lambda rc: rc[0])]
+    deck = "\n".join(header + subckt_lines + body + [".end"]) + "\n"
+
+    sidecar = {
+        "artifact": name,
+        "path": "cir_confession",
+        "stamp": stamp,
+        "modelled": dict(modelled),
+        "not_simulated": sorted(not_simulated, key=lambda e: e["refdes"]),
+        "node_map": dict(node_of),
+    }
+    return deck, sidecar
+
+
+def spice_should_emit(graph: Dict[str, Any], emit_spice: bool) -> bool:
+    """The §0/§6 gating decision, from the graph ALONE: a deck is written iff
+    the netlist has at least one modelled element AND (it is FULLY modelled, or
+    the intent explicitly requested emission). A partially-modelled intent that
+    neither qualifies nor requests emits nothing — the *declared* behavior, so
+    the gate never sees a silently smaller deck.
+
+    Deliberately CHEAP and node-map-free: it classifies components only, so an
+    intent that will emit no deck never pays for (and never trips) the §3
+    node-token collision check inside ``build_cir`` — that bijection discipline
+    is owed only by decks that are actually written. A malformed ``spice_model``
+    still raises here (an author error is loud regardless of emission)."""
+    n_modelled = n_unmodelled = 0
+    for comp in graph.get("components", []):
+        render, _reason = _spice_model_of(comp)
+        if render is None:
+            n_unmodelled += 1
+        else:
+            n_modelled += 1
+    if n_modelled == 0:
+        return False
+    if n_unmodelled == 0:
+        return True
+    return bool(emit_spice)
+
+
+# ---------------------------------------------------------------------------
+# The SPICE structural oracle (WyredPlanSpice step 1.3 / WyredSpiceContract
+# §5/§10): a minimal deck READER (the ga005 ``parse_spice`` subset — comments,
+# ``+`` continuations, element dispatch, subckt-instance connectivity) plus
+# ``crosscheck_cir``, the fourth data path in the cross-path differential. The
+# ``.cir`` is CHECKED against the L2 (the model of record) + its ``.cir.json``
+# confession sidecar, never trusted: a dropped/phantom element, a rewired node,
+# a value/letter inconsistent with the kind-table, or a forged/stale confession
+# each fires its ``XCIR_*`` code. The engine's own from-disk CLI runs it, and
+# the harness gate's negative battery proves every code fires (the lobotomy
+# verdict). Two independent implementations (emitter + reader) meeting at the
+# differential — gen 1's ``roundtrip.agree()`` shape, ported.
+# ---------------------------------------------------------------------------
+
+# The v0 two-terminal primitives (§1: MOSFETs and anything wider are ``subckt``,
+# read as an ``X`` instance). Element letter is the head's first char; the
+# refdes is the rest (build_cir writes ``<letter><refdes>`` so a strip of one
+# char recovers it).
+_CIR_PRIMITIVES = frozenset("RCLDVI")
+
+
+def _cir_logical_lines(text: str) -> List[str]:
+    """A SPICE deck's logical lines: ``*`` full-line comments and blanks
+    dropped, ``+`` continuations folded onto the previous line (the
+    ``parse_spice`` subset). build_cir emits neither inline ``;`` comments nor
+    continuations, but the reader honors both so a hand-written or re-wrapped
+    conforming deck reads the same."""
+    logical: List[str] = []
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("*"):
+            continue
+        if s.startswith("+"):
+            cont = s[1:].strip()
+            if logical:
+                logical[-1] = logical[-1] + " " + cont
+            else:
+                logical.append(cont)
+        else:
+            logical.append(s)
+    return logical
+
+
+def _parse_cir(text: str) -> List[Dict[str, Any]]:
+    """The minimal deck reader: element cards -> connectivity, INDEPENDENT of
+    build_cir. Each element is ``{refdes, letter, nodes: [token...], value}``
+    (subckt instances also carry ``subckt``). ``.subckt``/``.ends`` DEFINITION
+    bodies are skipped (their inline model text is not connectivity); every
+    other ``.``-card (``.end``, ``.model``, ...) is ignored. Two-terminal
+    primitives take the first two post-head tokens as nodes and the rest as the
+    value; a subckt instance ``X<refdes> <node...> <name>`` takes the trailing
+    token as the subckt name and the middle tokens as nodes."""
+    elements: List[Dict[str, Any]] = []
+    in_subckt = False
+    for line in _cir_logical_lines(text):
+        toks = line.split()
+        if not toks:
+            continue
+        head = toks[0]
+        if head.startswith("."):
+            low = head.lower()
+            if low == ".subckt":
+                in_subckt = True
+            elif low == ".ends":
+                in_subckt = False
+            continue
+        if in_subckt:
+            continue
+        letter = head[0].upper()
+        refdes = head[1:]
+        if letter == "X":
+            if len(toks) < 3:
+                continue
+            elements.append({"refdes": refdes, "letter": "X",
+                             "nodes": toks[1:-1], "value": toks[-1],
+                             "subckt": toks[-1]})
+        elif letter in _CIR_PRIMITIVES:
+            if len(toks) < 3:
+                continue
+            elements.append({"refdes": refdes, "letter": letter,
+                             "nodes": toks[1:3], "value": " ".join(toks[3:])})
+        else:
+            elements.append({"refdes": refdes, "letter": letter,
+                             "nodes": toks[1:], "value": ""})
+    return elements
+
+
+def _spice_model_token(render: Dict[str, Any]) -> str:
+    """The ``modelled`` map token build_cir records for a rendered component:
+    the element letter for a primitive, ``subckt:<name>`` for a subckt ref."""
+    if render["kind"] == "primitive":
+        return render["letter"]
+    return "subckt:%s" % render["name"]
+
+
+def _cir_partition(mapping: Dict[Any, Any]) -> set:
+    """The equivalence relation induced by ``{key: label}`` as a set of
+    frozensets of keys — the labels themselves are irrelevant, only which keys
+    share one. Comparing two such sets is the LVS-lite partition differential
+    (gen 1's ``agree()``): ground on both sides collapses to one class (L2's
+    ground nets -> one label, the deck's node ``0`` -> one label), so the
+    induced key-groups match iff the connectivity does."""
+    groups: Dict[Any, set] = {}
+    for key, label in mapping.items():
+        groups.setdefault(label, set()).add(key)
+    return {frozenset(v) for v in groups.values()}
+
+
+def crosscheck_cir(graph: Dict[str, Any], deck_text: str,
+                   sidecar: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Assert the ``.cir`` deck + its ``.cir.json`` sidecar denote the SAME
+    circuit as the L2 (the model of record). Every mismatch is a structured
+    ``{"code", "msg"}``; an empty list means the third denotation agrees.
+
+    Codes (WyredPlanSpice 1.3):
+
+    * ``XCIR_CONFESSION`` — the sidecar (``modelled`` / ``not_simulated`` /
+      ``node_map``) disagrees with what the L2 actually models under the §1/§2
+      classifier. A forged or stale confession — a real part hidden in
+      ``not_simulated``, a phantom confessed, a rewritten node map — is caught
+      here (§5: the sidecar is compared against the L2 + the deck every run).
+    * ``XCIR_COMPONENTS`` — the deck's refdes set != the L2 components minus the
+      confessed ``not_simulated`` set. A confessed part absent is legal; an
+      unconfessed absence or a phantom element is not.
+    * ``XCIR_ELEMENT`` — an element's letter or value is inconsistent with the
+      component's kind/model per the contract table (§1/§2a canonicalization).
+    * ``XCIR_NET_PARTITION`` — the deck's node partition != the L2 net partition
+      over the SIMULATED subgraph (the modelled components present in the deck).
+    """
+    fails: List[Dict[str, str]] = []
+
+    def fail(code: str, msg: str) -> None:
+        fails.append({"code": code, "msg": msg})
+
+    comps = graph.get("components", [])
+    comp_by_ref = {c["refdes"]: c for c in comps}
+
+    # Recompute the §1/§2 classification straight from the L2 — the honest
+    # answer the sidecar and deck are checked against.
+    recomputed_modelled: Dict[str, Dict[str, Any]] = {}
+    recomputed_ns: List[Dict[str, str]] = []
+    for c in comps:
+        ref = c["refdes"]
+        try:
+            render, reason = _spice_model_of(c)
+        except ModellerError:
+            render, reason = None, "bad_model"
+        if render is None:
+            recomputed_ns.append({"refdes": ref, "kind": c.get("kind", ""),
+                                  "reason": reason})
+        else:
+            recomputed_modelled[ref] = render
+
+    # --- XCIR_CONFESSION: the sidecar must not lie about the L2 --------------
+    want_modelled = {r: _spice_model_token(rd)
+                     for r, rd in recomputed_modelled.items()}
+    if sidecar.get("modelled", {}) != want_modelled:
+        fail("XCIR_CONFESSION",
+             "sidecar 'modelled' %r disagrees with the L2 classification %r"
+             % (sidecar.get("modelled", {}), want_modelled))
+    sc_ns = sorted(sidecar.get("not_simulated", []),
+                   key=lambda e: e.get("refdes", ""))
+    want_ns = sorted(recomputed_ns, key=lambda e: e["refdes"])
+    if sc_ns != want_ns:
+        fail("XCIR_CONFESSION",
+             "sidecar not_simulated %r disagrees with the L2's unmodelled "
+             "parts %r (a forged or stale confession)" % (sc_ns, want_ns))
+    node_map_ok = True
+    try:
+        want_node_map = _spice_node_map(graph)
+    except ModellerError as exc:
+        node_map_ok = False
+        fail("XCIR_NET_PARTITION",
+             "L2 net names collide under §3 sanitization: %s" % exc.msg)
+    if node_map_ok and sidecar.get("node_map", {}) != want_node_map:
+        fail("XCIR_CONFESSION",
+             "sidecar node_map %r disagrees with the L2 net->node map %r"
+             % (sidecar.get("node_map", {}), want_node_map))
+
+    # --- XCIR_COMPONENTS: deck refdes == L2 minus the confessed set ----------
+    elements = _parse_cir(deck_text)
+    deck_by_ref: Dict[str, Dict[str, Any]] = {}
+    deck_refs: List[str] = []
+    for e in elements:
+        deck_refs.append(e["refdes"])
+        deck_by_ref[e["refdes"]] = e
+    dupes = sorted({r for r in deck_refs if deck_refs.count(r) > 1})
+    if dupes:
+        fail("XCIR_COMPONENTS",
+             "deck lists an element refdes more than once: %s" % dupes)
+    deck_set = set(deck_refs)
+    confessed = {e.get("refdes") for e in sidecar.get("not_simulated", [])}
+    expected = {c["refdes"] for c in comps} - confessed
+    if deck_set != expected:
+        fail("XCIR_COMPONENTS",
+             "deck refdes set != L2 components minus the confessed set "
+             "(deck-only=%s, missing=%s)"
+             % (sorted(deck_set - expected), sorted(expected - deck_set)))
+
+    # --- XCIR_ELEMENT: letter + value vs the kind table ---------------------
+    for ref in sorted(recomputed_modelled):
+        e = deck_by_ref.get(ref)
+        if e is None:
+            continue        # absence is XCIR_COMPONENTS' finding, not this one
+        render = recomputed_modelled[ref]
+        if render["kind"] == "primitive":
+            want_value = render["value"]
+            for k in sorted(render["params"]):
+                want_value += " %s=%s" % (k, render["params"][k])
+            if e["letter"] != render["letter"]:
+                fail("XCIR_ELEMENT",
+                     "deck element %s has letter %r but its L2 kind/model "
+                     "implies %r" % (ref, e["letter"], render["letter"]))
+            elif e["value"] != want_value:
+                fail("XCIR_ELEMENT",
+                     "deck element %s carries value %r but its L2 model "
+                     "canonicalizes to %r" % (ref, e["value"], want_value))
+        else:
+            if e["letter"] != "X":
+                fail("XCIR_ELEMENT",
+                     "deck element %s should be a subckt instance (X) but is "
+                     "letter %r" % (ref, e["letter"]))
+            elif e.get("subckt") != render["name"]:
+                fail("XCIR_ELEMENT",
+                     "deck element %s instantiates subckt %r but its L2 model "
+                     "names %r" % (ref, e.get("subckt"), render["name"]))
+
+    # --- XCIR_NET_PARTITION: deck node partition == L2 net partition ---------
+    term_to_net: Dict[Tuple[str, str], Tuple[str, Optional[str]]] = {}
+    for net in graph.get("nets", []):
+        for ref, pin in net.get("nodes", []):
+            term_to_net[(ref, pin)] = (net["name"], net.get("kind"))
+    common = set(deck_by_ref) & set(recomputed_modelled)
+    l2_map: Dict[Tuple[str, int], Any] = {}
+    for ref in common:
+        for i, t in enumerate(comp_by_ref[ref].get("terminals", [])):
+            info = term_to_net.get((ref, t["name"]))
+            if info is None:
+                l2_map[(ref, i)] = ("float", ref, i)
+            elif info[1] == "ground":
+                l2_map[(ref, i)] = ("ground",)
+            else:
+                l2_map[(ref, i)] = ("net", info[0])
+    deck_map: Dict[Tuple[str, int], Any] = {}
+    for ref in common:
+        for i, node in enumerate(deck_by_ref[ref]["nodes"]):
+            deck_map[(ref, i)] = ("node", node)
+    if _cir_partition(l2_map) != _cir_partition(deck_map):
+        fail("XCIR_NET_PARTITION",
+             "deck node partition disagrees with the L2 net partition over "
+             "the simulated subgraph (%d modelled component(s))" % len(common))
+
+    return fails
 
 
 # ---------------------------------------------------------------------------
@@ -611,5 +1336,7 @@ def diff_pinmaps(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-__all__ = ["build_bom", "build_pinmap", "build_records", "crosscheck",
-           "check_connector_locks", "diff_pinmaps", "json_str"]
+__all__ = ["build_bom", "build_pinmap", "build_records", "build_placement",
+           "build_testplan", "build_cir", "spice_should_emit", "crosscheck",
+           "crosscheck_cir", "check_connector_locks", "diff_pinmaps",
+           "json_str"]

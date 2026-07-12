@@ -19,7 +19,10 @@ from .concepts import (Accepted, Concept, Rejected, family_provides,
 from .core import (Module, ModellerError, Refinement, bind, bond, bus,
                    demand, ground, late, lock_group, mutual_exclusion, param,
                    pin, pool, provide, rail, use,
-                   DECISION_CLASSES, INTENTS, MODULES, REFINEMENTS)
+                   near, keepout, edge, thermal, separation,
+                   expect_rail, expect_i2c_scan, expect_current, expect_signal,
+                   DECISION_CLASSES, INTENTS, MODULES, REFINEMENTS,
+                   PLACEMENT_SIDES, EDGE_TOL_MM_DEFAULT)
 from .engine import (Diagnostic, EmitResult, SOLVER_VERSION, elaborate,
                      exemplify)
 from .resolve import ResolveResult, resolve
@@ -30,7 +33,10 @@ __all__ = [
     "Module", "ModellerError", "Refinement", "bind", "bond", "bus", "demand",
     "ground", "late", "lock_group", "mutual_exclusion", "param", "pin",
     "pool", "provide", "rail", "use",
+    "near", "keepout", "edge", "thermal", "separation",
+    "expect_rail", "expect_i2c_scan", "expect_current", "expect_signal",
     "DECISION_CLASSES", "INTENTS", "MODULES", "REFINEMENTS",
+    "PLACEMENT_SIDES", "EDGE_TOL_MM_DEFAULT",
     "Diagnostic", "EmitResult", "SOLVER_VERSION", "elaborate", "exemplify",
     "ResolveResult", "resolve",
 ]

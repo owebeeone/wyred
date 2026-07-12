@@ -48,6 +48,9 @@ from .core import (
     ModellerError, Module, MutexDecl, ParamDecl, PinOp, BindOp, PoolDecl,
     ProvideDecl, RailDecl, DECISION_CLASSES, MODULES, resolve_value,
     validate_rail_name, use,
+    NearDecl, KeepoutDecl, EdgeDecl, ThermalDecl, SeparationDecl,
+    PLACEMENT_SIDES,
+    ExpectRailDecl, ExpectI2cScanDecl, ExpectCurrentDecl, ExpectSignalDecl,
 )
 
 SOLVER_VERSION = "ga019-trivial-1"
@@ -122,6 +125,11 @@ class EmitResult:
     allocation_entries: List[Dict[str, Any]]
     spares: Dict[str, List[int]]
     bindings: List[Tuple[str, str]]      # (role_id, part) — M2 input only
+    test_declarations: List[Dict[str, Any]] = field(default_factory=list)
+    # the elaborated ``expect_*`` records (proposal section 3): self-contained
+    # authored form (subject + derived nominal/addresses + tolerances), carried
+    # HERE and never in ``doc`` — the testplan emitter derives its checks block
+    # from these + records + pin-map; the l1 document stays byte-identical.
 
     def to_json_str(self) -> str:
         return json.dumps(self.doc, indent=2, sort_keys=True) + "\n"
@@ -137,6 +145,8 @@ class _Ctx:
         self.buses: List[Dict[str, Any]] = []
         self.pools: List[PoolFact] = []
         self.invariants: List[Dict[str, Any]] = []
+        self.placement: List[Dict[str, Any]] = []
+        self.tests: List[Dict[str, Any]] = []
         self.locks: List[Dict[str, Any]] = []
 
     def bus_named(self, name: str) -> Optional[Dict[str, Any]]:
@@ -236,6 +246,161 @@ def _validate_invariant_ref(owner_cls: Type[Module], decl_name: str,
             "signal label must have a declared existence"
             % (decl_name, owner_cls.__name__, ref, label, cur.__name__,
                ", ".join(sorted(signals)) or "none"))
+
+
+def _validate_placement_subject(owner_cls: Type[Module], decl_name: str,
+                                ref: Any) -> None:
+    """Compose-time validation of a placement subject reference (semantics
+    section 1: a subject names a ROLE — a module-relative dotted instance
+    path). Unlike an invariant signal reference, EVERY path segment names a
+    declared child (a role is a module instance, ``use(...)``): ``near("pmu",
+    "mcu")`` inside a composite is legal because ``pmu`` / ``mcu`` are
+    declared children; ``near("pmu", "ghost")`` is a structured load error
+    HERE, at declaration walk time — a placement subject that names no
+    declared role in scope never reaches the emitted document (law 10, no
+    silent defaults / no dangling references smuggled downstream)."""
+    if not isinstance(ref, str) or not ref:
+        raise ModellerError(
+            "PLACEMENT_BAD_SUBJECT",
+            "placement %r on %s has a non-string/empty subject reference %r"
+            % (decl_name, owner_cls.__name__, ref))
+    segs = ref.split(".")
+    if any(not s for s in segs):
+        raise ModellerError(
+            "PLACEMENT_BAD_SUBJECT",
+            "placement %r on %s subject %r has an empty path segment"
+            % (decl_name, owner_cls.__name__, ref))
+    cur = owner_cls
+    for seg in segs:
+        kids = {n: cd.module_cls for n, cd in cur._decls
+                if isinstance(cd, ChildDecl)}
+        if seg not in kids:
+            raise ModellerError(
+                "PLACEMENT_DANGLING_SUBJECT",
+                "placement %r on %s references role %r, but %r is not a "
+                "declared child of %s (declared children: %s) — a placement "
+                "subject must name a declared role"
+                % (decl_name, owner_cls.__name__, ref, seg, cur.__name__,
+                   ", ".join(sorted(kids)) or "none"))
+        cur = kids[seg]
+
+
+def _is_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _elaborate_test_decl(owner_cls: Type[Module], name: str, minted_id: str,
+                         declared_by: Dict[str, Any], d: Any,
+                         inst: Module) -> Dict[str, Any]:
+    """Elaborate ONE ``expect_*`` marker into its declaration record — the
+    self-contained authored form (subject + resolved tolerances). ``late(...)``
+    is resolved here (every argument); LOCAL tolerance well-formedness is
+    validated here (``TEST_BAD_TOLERANCE`` — RATIFY-1/4/5); rail/bus/demand
+    EXISTENCE and derived defaults (nominal, addresses) need the full L1
+    vocabulary and so are finalized post-walk in ``_check_consistency``. The
+    subject is ABSOLUTE L1 vocabulary — a rail/bus name (design vocabulary) or
+    a minted demand-id path — never a module-relative role, so it is resolved
+    but NOT namespaced by the declaring instance (unlike placement subjects)."""
+    def bad(msg: str) -> "ModellerError":
+        return ModellerError(
+            "TEST_BAD_TOLERANCE",
+            "%s %r on %s %s" % (d.__class__.__name__, name,
+                                owner_cls.__name__, msg))
+
+    row: Dict[str, Any] = {"id": minted_id, "declared_by": declared_by}
+    if isinstance(d, ExpectRailDecl):
+        volts = resolve_value(d.volts, inst)
+        tol = resolve_value(d.tol, inst)
+        tol_pct = resolve_value(d.tol_pct, inst)
+        if (tol is None) == (tol_pct is None):
+            raise bad("must declare EXACTLY one of tol / tol_pct "
+                      "(RATIFY-1: tolerance is required, never the 0.05 V "
+                      "float-noise absorber; got tol=%r tol_pct=%r)"
+                      % (tol, tol_pct))
+        given = tol if tol is not None else tol_pct
+        if not _is_number(given) or given <= 0:
+            raise bad("tolerance must be a positive number (got %r)" % given)
+        if volts is not None and (not _is_number(volts) or volts <= 0):
+            raise bad("volts (nominal) must be a positive number when "
+                      "given (got %r)" % volts)
+        row.update({"kind": "rail",
+                    "subject": resolve_value(d.tp, inst),
+                    "volts": volts})
+        if tol is not None:
+            row["tol"] = tol
+        else:
+            row["tol_pct"] = tol_pct
+    elif isinstance(d, ExpectI2cScanDecl):
+        addrs = resolve_value(d.addrs, inst)
+        if addrs is not None:
+            if not isinstance(addrs, (list, tuple)) or not all(
+                    isinstance(a, int) and not isinstance(a, bool)
+                    and a >= 0 for a in addrs):
+                raise bad("addrs must be a list of non-negative integer "
+                          "addresses when given (got %r)" % (addrs,))
+            addrs = sorted(set(int(a) for a in addrs))
+        row.update({"kind": "i2c_scan",
+                    "subject": resolve_value(d.bus, inst),
+                    "addrs": addrs})            # None -> derived post-walk
+    elif isinstance(d, ExpectCurrentDecl):
+        max_ma = resolve_value(d.max_ma, inst)
+        state = resolve_value(d.state, inst)
+        if not _is_number(max_ma) or max_ma <= 0:
+            raise bad("max_ma must be a positive number (RATIFY-4, one-sided "
+                      "upper bound; got %r)" % max_ma)
+        if not isinstance(state, str) or not state:
+            raise bad("state must be a non-empty string (RATIFY-4, the "
+                      "operating-state vocabulary; got %r)" % (state,))
+        row.update({"kind": "current",
+                    "subject": resolve_value(d.rail, inst),
+                    "max_ma": max_ma, "state": state})
+    elif isinstance(d, ExpectSignalDecl):
+        freq = resolve_value(d.freq, inst)
+        f_ppm = resolve_value(d.freq_tol_ppm, inst)
+        f_pct = resolve_value(d.freq_tol_pct, inst)
+        duty = resolve_value(d.duty, inst)
+        d_pts = resolve_value(d.duty_tol_pts, inst)
+        if freq is None and duty is None:
+            raise bad("declares neither freq nor duty — a signal check must "
+                      "measure at least one quantity (RATIFY-5)")
+        row.update({"kind": "signal", "subject": resolve_value(d.tp, inst)})
+        if freq is not None:
+            if not _is_number(freq) or freq <= 0:
+                raise bad("freq must be a positive number (got %r)" % freq)
+            if (f_ppm is None) == (f_pct is None):
+                raise bad("freq needs EXACTLY one of freq_tol_ppm / "
+                          "freq_tol_pct (RATIFY-5; got ppm=%r pct=%r)"
+                          % (f_ppm, f_pct))
+            given = f_ppm if f_ppm is not None else f_pct
+            if not _is_number(given) or given <= 0:
+                raise bad("freq tolerance must be a positive number "
+                          "(got %r)" % given)
+            row["freq"] = freq
+            if f_ppm is not None:
+                row["freq_tol_ppm"] = f_ppm
+            else:
+                row["freq_tol_pct"] = f_pct
+        elif f_ppm is not None or f_pct is not None:
+            raise bad("declares a freq tolerance without freq (RATIFY-5, no "
+                      "cross-quantity defaults)")
+        if duty is not None:
+            if not _is_number(duty) or not (0 <= duty <= 100):
+                raise bad("duty must be a number in [0, 100] percent "
+                          "(got %r)" % duty)
+            if d_pts is None:
+                raise bad("duty needs duty_tol_pts (RATIFY-5; got None)")
+            if not _is_number(d_pts) or d_pts <= 0:
+                raise bad("duty_tol_pts must be a positive number "
+                          "(got %r)" % d_pts)
+            row["duty"] = duty
+            row["duty_tol_pts"] = d_pts
+        elif d_pts is not None:
+            raise bad("declares duty_tol_pts without duty (RATIFY-5, no "
+                      "cross-quantity defaults)")
+    else:                                       # pragma: no cover - defensive
+        raise ModellerError("UNKNOWN_DECL",
+                            "unhandled test declaration %r" % (d,))
+    return row
 
 
 def _walk(inst: Module, path: str, enclosing_scope: str, ctx: _Ctx) -> None:
@@ -364,6 +529,84 @@ def _walk(inst: Module, path: str, enclosing_scope: str, ctx: _Ctx) -> None:
                 "inputs": [prefix + s for s in inputs],
                 "attrs": resolve_value(d.attrs, inst)})
             continue
+        if isinstance(d, (NearDecl, KeepoutDecl, EdgeDecl, ThermalDecl,
+                          SeparationDecl)):
+            # minted id + subject namespacing follow the mutual_exclusion
+            # precedent (semantics section 2): id = <instance path>.<attr>,
+            # role subjects prefixed by the instance path — declare once,
+            # mint one per instantiation. late() resolves inside params.
+            prefix = path + "." if path else ""
+            minted_id = prefix + name
+            declared_by = {"module": cls.__name__, "instance": path}
+            if isinstance(d, NearDecl):
+                for ref in d.subjects:
+                    _validate_placement_subject(cls, name, ref)
+                row = {
+                    "id": minted_id, "kind": "near",
+                    "declared_by": declared_by,
+                    "subjects": [prefix + s for s in d.subjects],
+                    "params": {"max_mm": resolve_value(d.max_mm, inst)}}
+            elif isinstance(d, KeepoutDecl):
+                for ref in d.roles:
+                    _validate_placement_subject(cls, name, ref)
+                row = {
+                    "id": minted_id, "kind": "keepout",
+                    "declared_by": declared_by,
+                    "subjects": [prefix + s for s in d.roles],
+                    "params": {"zone": resolve_value(d.zone, inst)}}
+            elif isinstance(d, EdgeDecl):
+                _validate_placement_subject(cls, name, d.connector)
+                side = resolve_value(d.side, inst)
+                if side not in PLACEMENT_SIDES:
+                    raise ModellerError(
+                        "PLACEMENT_BAD_SIDE",
+                        "edge %r on %s names side %r, which is not one of %s "
+                        "— the side vocabulary is a closed enum (a lock that "
+                        "silently protects nothing is rejected the same way)"
+                        % (name, cls.__name__, side, sorted(PLACEMENT_SIDES)))
+                row = {
+                    "id": minted_id, "kind": "edge",
+                    "declared_by": declared_by,
+                    "subjects": [prefix + d.connector],
+                    "params": {"side": side,
+                               "tol_mm": resolve_value(d.tol_mm, inst)}}
+            elif isinstance(d, ThermalDecl):
+                _validate_placement_subject(cls, name, d.role)
+                row = {
+                    "id": minted_id, "kind": "thermal",
+                    "declared_by": declared_by,
+                    "subjects": [prefix + d.role],
+                    "params": {"copper_mm2":
+                               resolve_value(d.copper_mm2, inst)}}
+            else:                                       # SeparationDecl
+                # net-class NAMES (declared rails/grounds), NOT namespaced
+                # role ids — design vocabulary. Existence is validated against
+                # the declared rail/ground set AFTER the walk (only then is
+                # the full vocabulary known); see _check_consistency.
+                row = {
+                    "id": minted_id, "kind": "separation",
+                    "declared_by": declared_by,
+                    "subjects": [resolve_value(d.class_a, inst),
+                                 resolve_value(d.class_b, inst)],
+                    "params": {"min_mm": resolve_value(d.min_mm, inst)}}
+            ctx.placement.append(row)
+            continue
+        if isinstance(d, (ExpectRailDecl, ExpectI2cScanDecl,
+                          ExpectCurrentDecl, ExpectSignalDecl)):
+            # minted id + declared_by follow the mutual_exclusion / placement
+            # precedent (id = <instance path>.<attr>, law 8). Subjects are
+            # ABSOLUTE L1 vocabulary, resolved but NOT namespaced. Vocabulary
+            # existence + derived defaults are finalized in _check_consistency
+            # (only there is the full rail/bus/demand set known); the test
+            # records are carried on the EmitResult, NEVER emitted into the
+            # layer-1 document (proposal section 3: l1.json byte-identical, no
+            # schema_l1 change).
+            prefix = path + "." if path else ""
+            minted_id = prefix + name
+            declared_by = {"module": cls.__name__, "instance": path}
+            ctx.tests.append(_elaborate_test_decl(
+                cls, name, minted_id, declared_by, d, inst))
+            continue
         if isinstance(d, LockDecl):
             bad = sorted(set(d.covers) - DECISION_CLASSES)
             if bad:
@@ -409,6 +652,79 @@ def _check_consistency(ctx: _Ctx, diags: List[Diagnostic]) -> None:
             raise ModellerError(
                 "BOND_DANGLING",
                 "bond %r joins undeclared ground(s) %s" % (b["name"], missing))
+    # separation net classes must name a DECLARED rail or ground (semantics
+    # section 3: net classes are design vocabulary, validated here where the
+    # full rail/ground set is known — a name matching neither is a
+    # compose-time load error, never a silently unverifiable constraint).
+    netclasses = ({r["name"] for r in ctx.rails}
+                  | {g["name"] for g in ctx.grounds})
+    for row in ctx.placement:
+        if row["kind"] != "separation":
+            continue
+        for cls_name in row["subjects"]:
+            if cls_name not in netclasses:
+                raise ModellerError(
+                    "PLACEMENT_UNKNOWN_NETCLASS",
+                    "separation %r names net class %r, which is neither a "
+                    "declared rail nor a declared ground (declared: %s) — a "
+                    "separation class must name the L1 rail/ground vocabulary"
+                    % (row["id"], cls_name,
+                       ", ".join(sorted(netclasses)) or "none"))
+    # test declarations: finalize the ``expect_*`` records now the full L1
+    # vocabulary is known (proposal sections 1-4). Reference EXISTENCE is a
+    # structured load error (law 10, TEST_UNKNOWN_*); derived defaults —
+    # nominal voltage (RATIFY-2) and expected addresses (RATIFY-6) — are baked
+    # into the self-contained declaration here (the testplan emitter never sees
+    # the L1 doc), derived numbers canonicalized as round(x, 6) (RATIFY-7).
+    rail_names = {r["name"] for r in ctx.rails}
+    rail_volts = {r["name"]: r["volts"] for r in ctx.rails}
+    bus_names = {b["name"] for b in ctx.buses}
+    demand_ids = {dem.id for role in ctx.roles for dem in role.demands}
+    bus_addrs: Dict[str, List[int]] = {}
+    for role in ctx.roles:
+        for dem in role.demands:
+            if dem.bus and "i2c_addr" in dem.attrs:
+                a = dem.attrs["i2c_addr"]
+                if isinstance(a, int) and not isinstance(a, bool):
+                    bus_addrs.setdefault(dem.bus, []).append(int(a))
+    for row in ctx.tests:
+        kind, subject, rid = row["kind"], row["subject"], row["id"]
+        if kind in ("rail", "current"):
+            if subject not in rail_names:
+                raise ModellerError(
+                    "TEST_UNKNOWN_RAIL",
+                    "%s check %r names rail %r, which is not a declared rail "
+                    "(declared: %s)" % (kind, rid, subject,
+                                        ", ".join(sorted(rail_names)) or "none"))
+        elif kind == "i2c_scan":
+            if subject not in bus_names:
+                raise ModellerError(
+                    "TEST_UNKNOWN_BUS",
+                    "i2c_scan check %r names bus %r, which is not a declared "
+                    "bus (declared: %s)" % (rid, subject,
+                                            ", ".join(sorted(bus_names))
+                                            or "none"))
+        elif kind == "signal":
+            if subject not in demand_ids:
+                raise ModellerError(
+                    "TEST_UNKNOWN_DEMAND",
+                    "signal check %r names demand %r, which is not a declared "
+                    "demand id (a minted instance path); declared: %s"
+                    % (rid, subject, ", ".join(sorted(demand_ids)) or "none"))
+        if kind == "rail":
+            volts = row.pop("volts")
+            if volts is None:                   # RATIFY-2: derive one-way
+                row["nominal"] = round(float(rail_volts[subject]), 6)
+                row["nominal_source"] = "derived"
+            else:
+                row["nominal"] = volts
+                row["nominal_source"] = "authored"
+        elif kind == "i2c_scan":
+            if row["addrs"] is None:            # RATIFY-6: derive the set
+                row["addrs"] = sorted(set(bus_addrs.get(subject, [])))
+                row["addrs_source"] = "derived"
+            else:
+                row["addrs_source"] = "authored"
     # rail-tree consistency: a capability driving a rail must drive a
     # DECLARED rail at ITS voltage
     for role in ctx.roles:
@@ -876,6 +1192,11 @@ def _emit_doc(ctx: _Ctx, series: str, escalations: List[Dict[str, Any]],
     _put(doc, "buses", buses_json, [])
     _put(doc, "pools", pools_json, [])
     _put(doc, "invariants", invs_json, [])
+    # placement: positive assertions only (semantics section 4, say-only-the-
+    # delta) — a document with no placement declarations omits the section
+    # entirely (the omit-when-empty pattern), so today's corpus emits no
+    # placement section and no .placement.json.
+    _put(doc, "placement", [dict(r) for r in ctx.placement], [])
     _put(doc, "escalations", escs_json, [])
 
     # scope-resolved-and-RECORDED (Gen4 2.1 "no hidden power pins") + spare
@@ -976,6 +1297,7 @@ def elaborate(intent_cls: Type[Module], doc_name: Optional[str] = None,
         allocation_entries=doc["allocation"]["entries"],
         spares=spares,
         bindings=bindings,
+        test_declarations=sorted(ctx.tests, key=lambda t: t["id"]),
     )
 
 

@@ -52,17 +52,37 @@ def check_artifact(out_dir: Path, name: str):
     for one artifact set, in the order the runner raised them."""
     fails = []
     l1 = _read_json(out_dir, name, "l1")
+    l2 = _read_json(out_dir, name, "l2")
 
     # cross-path differential (the architectural oracle, Gen4 section
     # 1.5): re-read every path FROM DISK and assert the netlist, BOM,
     # pin-map, records AND the emitted l1 (the provenance anchor for the
     # records path) describe one model.
     fails.extend(datapaths.crosscheck(
-        _read_json(out_dir, name, "l2"),
+        l2,
         _read_json(out_dir, name, "bom"),
         _read_json(out_dir, name, "pinmap"),
         _read_json(out_dir, name, "records"),
         l1=l1))
+
+    # SPICE structural oracle (WyredPlanSpice 1.3): the emit fired a ``.cir``
+    # data path for this set exactly when the intent was fully-modelled or
+    # requested emission — the deck's on-disk EXISTENCE is that frozen gating
+    # decision (§0/§6). Where the deck exists, its ``.cir.json`` confession
+    # sidecar must too; ``crosscheck_cir`` re-reads both FROM DISK and asserts
+    # the third denotation agrees with the L2 (XCIR_* codes). A set with no
+    # ``.cir`` owes no spice differential — absence was made honest at emit.
+    if (out_dir / ("%s.cir" % name)).exists():
+        deck_text = (out_dir / ("%s.cir" % name)).read_text()
+        sidecar_path = out_dir / ("%s.cir.json" % name)
+        if not sidecar_path.exists():
+            fails.append({
+                "code": "XCIR_CONFESSION",
+                "msg": "%s.cir exists but its %s.cir.json confession sidecar "
+                       "is missing" % (name, name)})
+        else:
+            fails.extend(datapaths.crosscheck_cir(
+                l2, deck_text, json.loads(sidecar_path.read_text())))
 
     # connector-pinout lock gate, from disk. The runner ran it exactly for
     # the emits that fired a group covering connector_pinout — the emits

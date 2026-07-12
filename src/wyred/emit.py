@@ -138,7 +138,13 @@ def _emit_all():
                          incumbents=inc_entries, fork=fork_tuple)
         res2 = elaborate(cls, doc_name=name, ops=ops,
                          incumbents=inc_entries, fork=fork_tuple)
-        deterministic = res1.to_json_str() == res2.to_json_str()
+        # the l1 doc AND the (non-doc) elaborated test declarations must both
+        # be byte-stable across two elaborations — test decls ride on the
+        # EmitResult, not the doc, so they need their own compare.
+        deterministic = (
+            res1.to_json_str() == res2.to_json_str()
+            and (json.dumps(res1.test_declarations, sort_keys=True)
+                 == json.dumps(res2.test_declarations, sort_keys=True)))
         by_name[name] = res1
         emitted.append((name, res1, deterministic, freeze, incumbents, fork))
     return emitted
@@ -158,6 +164,20 @@ def _expectations(name: str):
     esc = ref.expect_escalation if ref.expect_escalation is not None \
         else base.expect_escalation
     return sorted(exp), bool(esc)
+
+
+def _emit_spice_requested(name: str) -> bool:
+    """Whether the intent (or a refinement's base intent) requested SPICE
+    emission for a partially-modelled netlist (WyredSpiceContract §6). A
+    refinement inherits its base intent's request unless it overrides it — the
+    same inheritance ``_expectations`` applies to ``expected_l1``."""
+    if name in INTENTS:
+        return bool(getattr(INTENTS[name], "emit_spice", False))
+    ref = REFINEMENTS[name]
+    val = getattr(ref, "emit_spice", None)
+    if val is None:
+        val = getattr(INTENTS[ref.of], "emit_spice", False)
+    return bool(val)
 
 
 def _check_incumbency(parent_entries, child_entries):
@@ -395,6 +415,65 @@ def emit_artifacts(emitted, out_dir: Path) -> int:
             (out_dir / ("%s.records.json" % name)).write_text(
                 datapaths.json_str(records))
 
+            # ---- placement data path: L1-derived, only-when-declared -------
+            # (the .connlock.json/.baseline.json only-when-applicable
+            # pattern). Emitted IFF the elaborated doc carries a placement
+            # section, from the SAME layer-1 written to disk (rr1.l1), so the
+            # rebuild-from-primaries check reproduces it byte-identically.
+            # The current corpus declares no placement, so it emits none.
+            if rr1.l1.get("placement"):
+                placement = datapaths.build_placement(name, rr1.l1)
+                if (datapaths.json_str(placement)
+                        != datapaths.json_str(
+                            datapaths.build_placement(name, rr2.l1))):
+                    l2_det = False
+                (out_dir / ("%s.placement.json" % name)).write_text(
+                    datapaths.json_str(placement))
+
+            # ---- testplan data path: derived checks, only-when-declared ----
+            # (proposal section 3: the elaborated declarations ride on the
+            # EmitResult, NEVER in the l1 document — l1.json stays
+            # byte-identical and the harness schema_l1 is untouched — so the
+            # testplan is written straight from res.test_declarations + the
+            # SAME records + pin-map of this emit; its checks re-derive from
+            # those primaries at rebuild time. Emitted IFF the intent declared
+            # expect_* tests; today's golden corpus declares none.)
+            if res.test_declarations:
+                testplan = datapaths.build_testplan(
+                    name, res.test_declarations, records, pinmap)
+                records2 = datapaths.build_records(name, rr2.l1, rr2.alloc)
+                pinmap2 = datapaths.build_pinmap(
+                    name, rr2.graph, rr2.alloc, rr2.alloc_wiring)
+                if (datapaths.json_str(testplan) != datapaths.json_str(
+                        datapaths.build_testplan(
+                            name, res.test_declarations,
+                            records2, pinmap2))):
+                    l2_det = False
+                (out_dir / ("%s.testplan.json" % name)).write_text(
+                    datapaths.json_str(testplan))
+
+            # ---- SPICE .cir data path: gated, only-when-modelled-or- --------
+            # requested (WyredSpiceContract §0/§6). build_cir is a PURE
+            # function of (l2, alloc) — the deck + confession sidecar — and the
+            # emit loop alone decides whether to WRITE it (fully-modelled ->
+            # always; partially-modelled -> only when the intent set
+            # emit_spice). No ga019 part carries a spice model, so today's
+            # corpus emits ZERO .cir files and every existing golden stays
+            # byte-identical; the deck is deterministic across two resolves like
+            # every other path, and its on-disk EXISTENCE is the gating decision
+            # the rebuild CLI keys on.
+            if datapaths.spice_should_emit(rr1.graph,
+                                           _emit_spice_requested(name)):
+                deck, sidecar = datapaths.build_cir(name, rr1.graph, rr1.alloc)
+                deck2, sidecar2 = datapaths.build_cir(
+                    name, rr2.graph, rr2.alloc)
+                if (deck != deck2 or datapaths.json_str(sidecar)
+                        != datapaths.json_str(sidecar2)):
+                    l2_det = False
+                (out_dir / ("%s.cir" % name)).write_text(deck)
+                (out_dir / ("%s.cir.json" % name)).write_text(
+                    datapaths.json_str(sidecar))
+
             resolved[name] = rr1
             pinmaps[name] = pinmap
 
@@ -572,6 +651,13 @@ def emit_artifacts(emitted, out_dir: Path) -> int:
         else:
             # no netlist for a failing layer 1 — write the L1 artifact only
             (out_dir / ("%s.l1.json" % name)).write_text(res.to_json_str())
+            # placement is an L1-only assertion (no L2 lowering in v0), so a
+            # layer 1 that fails the oracle still carries its declared
+            # placement intent to the checker — emit it from the same L1.
+            if res.doc.get("placement"):
+                (out_dir / ("%s.placement.json" % name)).write_text(
+                    datapaths.json_str(
+                        datapaths.build_placement(name, res.doc)))
 
         l2_note = "" if wants_l2 else "  L2=(none: fails at L1 by design)"
         print("EMIT %-28s declared codes=%s%s"
